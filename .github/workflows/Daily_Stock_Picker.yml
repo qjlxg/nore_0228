@@ -1,0 +1,44 @@
+name: Daily_Stock_Picker
+
+on:
+  push:
+    paths:
+      - 'Daily_Stock_Picker.py'
+      - '.github/workflows/Daily_Stock_Picker.yml'
+  schedule:
+    - cron: '30 10 * * *' # 每天北京时间18:30自动选股
+  workflow_dispatch: 
+
+jobs:
+  stock_pick_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+       
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Run Engine
+        env:
+          TZ: Asia/Shanghai
+        run: |
+          pip install pandas numpy
+          python Daily_Stock_Picker.py
+
+      - name: Auto Commit Results
+        run: |
+          git config --local user.email "bot@github.com"
+          git config --local user.name "StockPickerBot"
+          # 强制拉取最新代码，防止 push 冲突
+          git pull --rebase origin main
+          git add .
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Auto Pick: $(date +'%Y-%m-%d %H:%M')"
+            git push origin main
+          else
+            echo "No changes to commit"
+          fi

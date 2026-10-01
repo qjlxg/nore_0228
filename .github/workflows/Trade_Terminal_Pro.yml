@@ -1,0 +1,52 @@
+name: 🚀 终端 
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'Trade_Terminal_Pro.py'
+      - 'stock_data/**'
+      - '.github/workflows/Trade_Terminal_Pro.yml'
+  schedule:
+   
+    - cron: '35 9 * * 1-5'     
+  workflow_dispatch:
+
+jobs:
+  trading_task:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: 🔍 检出代码
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: 🐍 配置 Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: 📦 安装核心依赖
+      run: pip install pandas numpy
+
+    - name: 📈 执行扫描逻辑
+      run: |
+        export TZ='Asia/Shanghai'
+        python Trade_Terminal_Pro.py
+
+    - name: 💾 持久化指令单 (Push to Repo)
+      run: |
+        git config --global user.name 'Gemini-Trader-Bot'
+        git config --global user.email 'bot@trading.ai'
+        
+        # 检查指定目录下是否有新 CSV
+        if ls Trade_Terminal_Pro/Signals_*.csv 1> /dev/null 2>&1; then
+          git add Trade_Terminal_Pro/Signals_*.csv
+          git commit -m "🤖 复盘更新: $(export TZ='Asia/Shanghai'; date +'%Y-%m-%d %H:%M')"
+          git push
+        else
+          echo "⚠️ 今日无符合信号。"
+        fi
