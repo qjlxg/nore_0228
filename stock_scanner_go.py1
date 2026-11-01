@@ -1,0 +1,212 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import os
+import pytz
+import glob
+from multiprocessing import Pool, cpu_count, Manager
+import warnings
+
+# 忽略计算中的无关警告
+warnings.filterwarnings('ignore')
+
+# ==================== 核心参数配置 (极致爆发 & 风险对冲版) ====================
+MIN_PRICE = 5.0              # 过滤低价股/仙股
+MAX_PRICE = 25.0             # 价格上限：设为25
+MAX_AVG_TURNOVER_30 = 3.0    # 换手率上限微调，允许更活跃的资金
+MIN_VOLUME_RATIO = 1.2       # 量比设定的1.2
+MAX_VOLUME_RATIO = 4.0       # 允许巨量但拒绝“天量”（天量往往是主力对倒出货）
+MAX_TODAY_CHANGE = 8.0       # 【关键修改】放量1.8倍通常是大阳线，放宽至8%防止错过领涨股
+MIN_PROFIT_POTENTIAL = 12.0  # 距60日线空间（略微调低，兼顾反弹效率）
+
+# --- 多周期共振阈值 ---
+RSI6_MAX = 38               # 【微调】RSI放宽至30，配合1.8倍量能，捕捉“刚脱离底部”的瞬间
+RSI_WEEKLY_MAX = 40          # 周线只要在中低位即可，不一定要极度超跌
+LOOKBACK_WINDOW = 250        # 参考最近一年数据
+# =====================================================================
+
+SHANGHAI_TZ = pytz.timezone('Asia/Shanghai')
+STOCK_DATA_DIR = 'stock_data'
+NAME_MAP_FILE = 'stock_names.csv'
+
+def calculate_indicators(df):
+    """计算日线核心指标"""
+    df = df.reset_index(drop=True)
+    close = df['收盘']
+    
+    # 1. 均线
+    df['ma5'] = close.rolling(5).mean()
+    df['ma10'] = close.rolling(10).mean()
+    df['ma60'] = close.rolling(60).mean()
+    # 【新增】MA5斜率，确保短期趋势拐头向上
+    df['ma5_slope'] = df['ma5'] > df['ma5'].shift(1)
+    
+    # 2. RSI6
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=6).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=6).mean()
+    df['rsi6'] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    
+    # 3. KDJ
+    low_9 = df['最低'].rolling(9).min()
+    high_9 = df['最高'].rolling(9).max()
+    rsv = (close - low_9) / (high_9 - low_9) * 100
+    df['k_line'] = rsv.ewm(com=2).mean()
+    df['d_line'] = df['k_line'].ewm(com=2).mean()
+    
+    # 4. MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df['diff'] = ema12 - ema26
+    df['dea'] = df['diff'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = (df['diff'] - df['dea']) * 2
+    df['macd_improving'] = df['macd_hist'] > df['macd_hist'].shift(1)
+
+    # 5. 量能
+    # 【优化】采用更稳健的5日均量对比
+    df['vol_ma5'] = df['成交量'].shift(1).rolling(5).mean()
+    df['vol_ratio'] = df['成交量'] / df['vol_ma5']
+    return df
+
+def get_weekly_resonance(df_daily):
+    """周线重采样及超跌判定"""
+    df_temp = df_daily.copy()
+    df_temp['日期'] = pd.to_datetime(df_temp['日期'])
+    # 修复重采样逻辑，确保获取真实的周线价格
+    df_weekly = df_temp.resample('W', on='日期').agg({'收盘': 'last'}).dropna()
+    
+    if len(df_weekly) < 7: return 100.0
+    
+    delta = df_weekly['收盘'].diff()
+    gain = delta.where(delta > 0, 0).rolling(6).mean()
+    loss = abs(delta).rolling(6).mean()
+    df_weekly['w_rsi6'] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    return df_weekly.iloc[-1]['w_rsi6']
+
+def evaluate_stock_power(df):
+    """【优化】回测打分逻辑：增加样本量权重"""
+    if len(df) < LOOKBACK_WINDOW: return 0.0
+    history = df.iloc[-LOOKBACK_WINDOW:].copy()
+    
+    # 定义历史上的信号点 (需符合：超跌 + 价格站上MA5)
+    history['sig'] = (history['rsi6'] < 30) & (history['收盘'] > history['ma5'])
+    sig_indices = history[history['sig']].index
+    
+    if len(sig_indices) < 3: return 40.0 # 样本太少，给予低基础分，防止虚高100%
+    
+    wins = 0
+    total = 0
+    for idx in sig_indices:
+        current_pos = df.index.get_loc(idx)
+        if current_pos + 10 < len(df): # 缩短回测窗口至10日，更符合短线点火逻辑
+            total += 1
+            # 10日内最高价涨幅超过5%即视为有效点火
+            future_max = df.iloc[current_pos+1:current_pos+11]['最高'].max()
+            if future_max > df.iloc[current_pos]['收盘'] * 1.05:
+                wins += 1
+                
+    base_rate = (wins / total * 100) if total > 0 else 0
+    # 惩罚项：如果历史信号极少（如仅1-2次），将胜率置信度降低
+    if total < 5: base_rate *= 0.7 
+    return base_rate
+
+def process_stock(args):
+    file_path, name_map, stats_dict = args
+    stock_code = os.path.basename(file_path).split('.')[0]
+    stock_name = name_map.get(stock_code, "未知")
+    if any(x in stock_name for x in ["ST", "退"]): return None
+
+    try:
+        df_raw = pd.read_csv(file_path)
+        if len(df_raw) < 120: return None
+        
+        df = calculate_indicators(df_raw)
+        latest = df.iloc[-1]
+        
+        # 基础过滤
+        stats_dict['total'] += 1
+        if not (MIN_PRICE <= latest['收盘'] <= MAX_PRICE):
+            return None
+        
+        potential = (latest['ma60'] - latest['收盘']) / latest['收盘'] * 100
+        
+        # --- 核心判定逻辑 ---
+        # 1. 超跌确认：日线RSI极低
+        is_oversold_daily = latest['rsi6'] < RSI6_MAX
+        
+        # 2. 【优化】点火确认：站上MA5 + MA5拐头 + MACD改善 + 量比确认
+        is_ignition = (latest['收盘'] > latest['ma5']) and \
+                       latest['ma5_slope'] and \
+                       latest['macd_improving'] and \
+                       (MIN_VOLUME_RATIO < latest['vol_ratio'] < MAX_VOLUME_RATIO)
+        
+        if is_oversold_daily and is_ignition:
+            # 3. 引入周线共振
+            w_rsi6 = get_weekly_resonance(df_raw)
+            is_weekly_resonance = w_rsi6 < RSI_WEEKLY_MAX
+            
+            # 4. 引入历史胜率评分
+            power_score = evaluate_stock_power(df)
+            
+            # 等级判定 (SSS标准提高：需高胜率 + 周线共振 + 距60日线空间)
+            if is_weekly_resonance and power_score >= 60 and potential > 15:
+                grade = "SSS-战略共振"
+            elif is_weekly_resonance:
+                grade = "S-周线底启动"
+            elif power_score >= 60:
+                grade = "A-高胜率点火"
+            else:
+                grade = "B-普通超跌"
+            
+            return {
+                '等级': grade,
+                '代码': stock_code,
+                '名称': stock_name,
+                '现价': round(latest['收盘'], 2),
+                '量比': round(latest['vol_ratio'], 2),
+                '历史胜率': f"{round(power_score, 1)}%",
+                '周线RSI': round(w_rsi6, 1),
+                '距60日线': f"{round(potential, 1)}%",
+                '今日涨跌': f"{round(latest['涨跌幅'], 1)}%"
+            }
+    except:
+        return None
+    return None
+
+def main():
+    now = datetime.now(SHANGHAI_TZ)
+    print(f"🚀 优化版多周期潜力扫描仪启动... ({now.strftime('%Y-%m-%d %H:%M')})")
+    
+    manager = Manager()
+    stats_dict = manager.dict({'total': 0})
+    
+    name_map = {}
+    if os.path.exists(NAME_MAP_FILE):
+        n_df = pd.read_csv(NAME_MAP_FILE, dtype={'code': str})
+        name_map = dict(zip(n_df['code'].str.zfill(6), n_df['name']))
+
+    files = glob.glob(os.path.join(STOCK_DATA_DIR, '*.csv'))
+    tasks = [(f, name_map, stats_dict) for f in files]
+
+    with Pool(cpu_count()) as pool:
+        results = pool.map(process_stock, tasks)
+
+    valid_results = [r for r in results if r is not None]
+    
+    if valid_results:
+        df_res = pd.DataFrame(valid_results)
+        # 优先级：SSS > S > A > B，同等级下看空间
+        grade_order = {"SSS-战略共振": 0, "S-周线底启动": 1, "A-高胜率点火": 2, "B-普通超跌": 3}
+        df_res['order'] = df_res['等级'].map(grade_order)
+        df_res = df_res.sort_values(by=['order', '距60日线'], ascending=[True, False]).drop(columns=['order'])
+        
+        print(f"\n🎯 选出潜力标的 ({len(valid_results)} 只):")
+        print(df_res.to_string(index=False))
+        
+        os.makedirs("results", exist_ok=True)
+        df_res.to_csv(f"results/优化潜力表_{now.strftime('%Y%m%d')}.csv", index=False, encoding='utf_8_sig')
+    else:
+        print("\n当前市场未发现满足“量价共振”的高潜力信号。")
+
+if __name__ == "__main__":
+    main()

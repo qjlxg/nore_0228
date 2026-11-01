@@ -1,0 +1,60 @@
+name: Single_Yang_Retrace
+
+on:
+  schedule:
+    # 每天北京时间 16:30 自动运行 (UTC 8:30)
+    - cron: '30 8 * * *'
+  push:
+    paths:
+      - 'Single_Yang_Retrace.py'
+      - '.github/workflows/Single_Yang_Retrace.yml'
+  workflow_dispatch: # 支持手动点击运行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 授予 Actions 写入权限，防止 Push 失败
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # 获取完整提交历史，避免 rebase 冲突
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas numpy
+
+      - name: Run Screening Script
+        # 执行你的选股脚本（适配你提到的日期/代码等 CSV 格式）
+        run: python Single_Yang_Retrace.py
+
+      - name: Commit and Push Results
+        run: |
+          # 1. 配置身份信息
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # 2. 检查是否有文件更新 (Latest_Result.csv 或 results 文件夹)
+          git add .
+          
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "检测到数据更新，正在提交..."
+            git commit -m "自动更新选股名单: $(date +'%Y-%m-%d %H:%M') [强势型优先/剔除6天]"
+            
+            # 3. 核心修复：先拉取远程更改并进行变基 (Rebase)
+            # 这会将你的本地提交“接”在远程最新提交之后，解决 rejected 错误
+            git pull --rebase origin main
+            
+            # 4. 推送到远程
+            git push origin main
+          else
+            echo "没有发现符合战法的新个股，无需更新。"
+          fi

@@ -1,0 +1,73 @@
+name: 🔄 go版
+
+on:
+  workflow_dispatch:        # 支持手动触发
+  push:
+    paths:
+      - 'stock_scanner_go.py' 
+      - '.github/workflows/stock_scanner_go.yml'
+  schedule:
+    - cron: '38 7 * * *'    # 每天北京时间 15:30 运行 (UTC 7:30)
+
+permissions:
+  contents: write           # 核心：必须赋予写入权限
+
+jobs:
+  run_scanner:
+    timeout-minutes: 60 
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ⬇️ 检出代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1 
+
+      - name: 🐍 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: ⚙️ 安装依赖
+        run: |
+          pip install akshare pandas pytz numpy
+
+      - name: 🚀 运行脚本
+        run: |
+         
+          python stock_scanner_go.py
+
+      - name: 💾 自动同步并提交结果
+        run: |
+          # 1. 配置 Git 基础信息
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git config --global core.quotepath false
+          
+         
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "📦 发现新生成的 CSV 数据，正在进入暂存区..."
+            git add .
+            git stash
+          fi
+          
+          # 3. 拉取远程更新，防止多人协作或多次运行导致的 Push 失败
+          git pull origin ${{ github.ref_name }} --rebase
+          
+          # 4. 释放暂存的文件
+          if git stash list | grep -q "stash@{0}"; then
+            echo "🔓 释放暂存数据到当前工作区..."
+            git stash pop
+          fi
+          
+          # 5. 提交并推送
+          
+          git add results/*.csv
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "📝 准备提交更新..."
+            git commit -m "🤖 自动更新go: $(date +'%Y-%m-%d %H:%M')"
+            git push origin ${{ github.ref_name }}
+          else
+            echo "✅ 本次运行未发现标的变动，无需更新仓库。"
+          fi
